@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useQueryState } from 'nuqs';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -9,16 +9,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { buildUserPrompt, type CapstoneFormData } from '@/lib/prompt';
+import { useToastNotifications } from '@/components/ui/toast';
 import { 
+  AlertCircle,
   BookOpen, 
+  Calendar,
   Clock, 
-  Target, 
   FileText, 
+  GraduationCap,
   Lightbulb, 
   Sparkles,
-  GraduationCap,
-  Calendar,
-  CheckCircle
+  Target
 } from 'lucide-react';
 
 interface CapstoneFormProps {
@@ -59,6 +60,43 @@ const DELIVERABLES_OPTIONS = [
   'Other'
 ];
 
+// Form validation types
+interface FormErrors {
+  topic?: string;
+  discipline?: string;
+  duration?: string;
+  constraints?: string;
+  deliverables?: string;
+}
+
+// Input validation functions
+const validateTopic = (topic: string): string | undefined => {
+  if (!topic.trim()) {
+    return 'Project topic is required';
+  }
+  if (topic.trim().length < 5) {
+    return 'Project topic must be at least 5 characters long';
+  }
+  if (topic.length > 200) {
+    return 'Project topic must be less than 200 characters';
+  }
+  // Check for potentially harmful content
+  if (/<script|javascript:|data:/i.test(topic)) {
+    return 'Invalid characters detected in topic';
+  }
+  return undefined;
+};
+
+const validateConstraints = (constraints: string): string | undefined => {
+  if (constraints && constraints.length > 1000) {
+    return 'Constraints must be less than 1000 characters';
+  }
+  if (constraints && /<script|javascript:|data:/i.test(constraints)) {
+    return 'Invalid characters detected in constraints';
+  }
+  return undefined;
+};
+
 export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
   // URL state management with nuqs
   const [topic, setTopic] = useQueryState('topic', { defaultValue: '' });
@@ -67,24 +105,83 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
   const [duration, setDuration] = useQueryState('duration', { defaultValue: '' });
   const [deliverables, setDeliverables] = useQueryState('deliverables', { defaultValue: '' });
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Form state
+  const [errors, setErrors] = useState<FormErrors>({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const { showError, showSuccess } = useToastNotifications();
+
+  // Validate form fields
+  const validateForm = useCallback((): boolean => {
+    const newErrors: FormErrors = {};
+
+    // Validate required fields
+    const topicError = validateTopic(topic);
+    if (topicError) newErrors.topic = topicError;
+
+    if (!discipline) {
+      newErrors.discipline = 'Academic discipline is required';
+    }
+
+    if (!duration) {
+      newErrors.duration = 'Project duration is required';
+    }
+
+    // Validate optional fields
+    const constraintsError = validateConstraints(constraints);
+    if (constraintsError) newErrors.constraints = constraintsError;
+
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  }, [topic, discipline, duration, constraints]);
+
+  // Handle field changes with validation
+  const handleTopicChange = useCallback((value: string) => {
+    setTopic(value);
+    if (errors.topic) {
+      const error = validateTopic(value);
+      setErrors(prev => ({ ...prev, topic: error }));
+    }
+  }, [setTopic, errors.topic]);
+
+  const handleConstraintsChange = useCallback((value: string) => {
+    setConstraints(value);
+    if (errors.constraints) {
+      const error = validateConstraints(value);
+      setErrors(prev => ({ ...prev, constraints: error }));
+    }
+  }, [setConstraints, errors.constraints]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    if (!topic || !discipline || !duration) {
-      alert('Please fill in the required fields: Topic, Discipline, and Duration');
+    if (isSubmitting) return;
+
+    // Validate form
+    if (!validateForm()) {
+      showError('Please fix the errors below', 'Some required fields are missing or invalid');
       return;
     }
 
-    const formData: CapstoneFormData = {
-      topic,
-      discipline,
-      constraints: constraints || 'No specific constraints',
-      duration,
-      deliverables: deliverables || 'Standard capstone deliverables'
-    };
+    setIsSubmitting(true);
 
-    const prompt = buildUserPrompt(formData);
-    onGenerate(prompt);
+    try {
+      const formData: CapstoneFormData = {
+        topic: topic.trim(),
+        discipline,
+        constraints: constraints.trim() || 'No specific constraints',
+        duration,
+        deliverables: deliverables || 'Standard capstone deliverables'
+      };
+
+      const prompt = buildUserPrompt(formData);
+      onGenerate(prompt);
+      showSuccess('Form submitted successfully', 'Your capstone plan is being generated');
+    } catch (error) {
+      console.error('Form submission error:', error);
+      showError('Submission failed', 'An error occurred while processing your request. Please try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -114,14 +211,26 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
                     Project Topic *
                   </label>
                 </div>
-                <Input
-                  id="topic"
-                  value={topic}
-                  onChange={(e) => setTopic(e.target.value)}
-                  placeholder="e.g., Machine Learning for Healthcare, E-commerce Platform, IoT Security"
-                  className="h-12 text-base border-2 focus:border-blue-500 transition-colors"
-                  required
-                />
+                <div className="space-y-2">
+                  <Input
+                    id="topic"
+                    value={topic}
+                    onChange={(e) => handleTopicChange(e.target.value)}
+                    placeholder="e.g., Machine Learning for Healthcare, E-commerce Platform, IoT Security"
+                    className={`h-12 text-base border-2 transition-colors ${
+                      errors.topic 
+                        ? 'border-red-500 focus:border-red-500' 
+                        : 'border-gray-300 focus:border-blue-500'
+                    }`}
+                    required
+                  />
+                  {errors.topic && (
+                    <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400">
+                      <AlertCircle className="h-4 w-4" />
+                      <span>{errors.topic}</span>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Academic Discipline */}
@@ -134,18 +243,34 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
                     Academic Discipline *
                   </label>
                 </div>
-                <Select value={discipline} onValueChange={setDiscipline} required>
-                  <SelectTrigger className="h-12 text-base border-2 focus:border-purple-500 transition-colors">
-                    <SelectValue placeholder="Select your discipline" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {DISCIPLINES.map((d) => (
-                      <SelectItem key={d} value={d}>
-                        {d}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div className="space-y-2">
+                  <Select 
+                    value={discipline} 
+                    onValueChange={setDiscipline} 
+                    required
+                  >
+                    <SelectTrigger className={`h-12 text-base border-2 transition-colors ${
+                      errors.discipline 
+                        ? 'border-red-500 focus:border-red-500' 
+                        : 'border-gray-300 focus:border-purple-500'
+                    }`}>
+                      <SelectValue placeholder="Select your discipline" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {DISCIPLINES.map((d) => (
+                        <SelectItem key={d} value={d}>
+                          {d}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {errors.discipline && (
+                    <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400">
+                      <AlertCircle className="h-4 w-4" />
+                      <span>{errors.discipline}</span>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Project Duration */}
@@ -158,18 +283,34 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
                     Project Duration *
                   </label>
                 </div>
-                <Select value={duration} onValueChange={setDuration} required>
-                  <SelectTrigger className="h-12 text-base border-2 focus:border-green-500 transition-colors">
-                    <SelectValue placeholder="Select project duration" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {DURATIONS.map((d) => (
-                      <SelectItem key={d} value={d}>
-                        {d}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div className="space-y-2">
+                  <Select 
+                    value={duration} 
+                    onValueChange={setDuration} 
+                    required
+                  >
+                    <SelectTrigger className={`h-12 text-base border-2 transition-colors ${
+                      errors.duration 
+                        ? 'border-red-500 focus:border-red-500' 
+                        : 'border-gray-300 focus:border-green-500'
+                    }`}>
+                      <SelectValue placeholder="Select project duration" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {DURATIONS.map((d) => (
+                        <SelectItem key={d} value={d}>
+                          {d}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {errors.duration && (
+                    <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400">
+                      <AlertCircle className="h-4 w-4" />
+                      <span>{errors.duration}</span>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Preferred Deliverables */}
@@ -182,7 +323,10 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
                     Preferred Deliverables
                   </label>
                 </div>
-                <Select value={deliverables} onValueChange={setDeliverables}>
+                <Select 
+                  value={deliverables} 
+                  onValueChange={setDeliverables}
+                >
                   <SelectTrigger className="h-12 text-base border-2 focus:border-orange-500 transition-colors">
                     <SelectValue placeholder="Select preferred deliverables" />
                   </SelectTrigger>
@@ -206,14 +350,26 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
                     Constraints & Requirements
                   </label>
                 </div>
-                <Textarea
-                  id="constraints"
-                  value={constraints}
-                  onChange={(e) => setConstraints(e.target.value)}
-                  placeholder="e.g., Must use specific technologies, budget limitations, team size, accessibility requirements"
-                  rows={4}
-                  className="text-base border-2 focus:border-red-500 transition-colors resize-none"
-                />
+                <div className="space-y-2">
+                  <Textarea
+                    id="constraints"
+                    value={constraints}
+                    onChange={(e) => handleConstraintsChange(e.target.value)}
+                    placeholder="e.g., Must use specific technologies, budget limitations, team size, accessibility requirements"
+                    rows={4}
+                    className={`text-base border-2 transition-colors resize-none ${
+                      errors.constraints 
+                        ? 'border-red-500 focus:border-red-500' 
+                        : 'border-gray-300 focus:border-red-500'
+                    }`}
+                  />
+                  {errors.constraints && (
+                    <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400">
+                      <AlertCircle className="h-4 w-4" />
+                      <span>{errors.constraints}</span>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -224,12 +380,12 @@ export function CapstoneForm({ onGenerate, isGenerating }: CapstoneFormProps) {
                 type="submit" 
                 className="w-full md:w-auto px-12 py-4 text-lg font-semibold bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white rounded-xl shadow-lg hover:shadow-xl transition-all duration-300 transform hover:-translate-y-1"
                 size="lg"
-                disabled={isGenerating}
+                disabled={isGenerating || isSubmitting}
               >
-                {isGenerating ? (
+                {(isGenerating || isSubmitting) ? (
                   <>
                     <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-3"></div>
-                    Generating Your Plan...
+                    {isSubmitting ? 'Submitting...' : 'Generating Your Plan...'}
                   </>
                 ) : (
                   <>

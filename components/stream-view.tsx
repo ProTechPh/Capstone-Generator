@@ -1,14 +1,21 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Separator } from '@/components/ui/separator';
-import { Copy, Download, FileText, Loader2 } from 'lucide-react';
+import { useToastNotifications } from '@/components/ui/toast';
+import { AlertCircle, Copy, Download, FileText, Loader2, RefreshCw } from 'lucide-react';
 
 interface StreamViewProps {
   prompt: string;
   onComplete?: () => void;
+}
+
+// Error types for better error handling
+interface StreamError {
+  code: string;
+  message: string;
+  retryable: boolean;
 }
 
 export function StreamView({ prompt, onComplete }: StreamViewProps) {
@@ -16,7 +23,15 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isComplete, setIsComplete] = useState(false);
   const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+  const [error, setError] = useState<StreamError | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const [isRetrying, setIsRetrying] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const { showError, showSuccess, showWarning } = useToastNotifications();
+
+  const maxRetries = 3;
+  const retryDelay = 2000; // 2 seconds
 
   useEffect(() => {
     if (prompt) {
@@ -24,10 +39,50 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
     }
   }, [prompt]);
 
-  const startStreaming = async () => {
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
+  const parseErrorResponse = async (response: Response): Promise<StreamError> => {
+    try {
+      const errorData = await response.json();
+      return {
+        code: errorData.error?.code || 'UNKNOWN_ERROR',
+        message: errorData.error?.message || 'An unknown error occurred',
+        retryable: response.status >= 500 || response.status === 429
+      };
+    } catch {
+      return {
+        code: 'PARSE_ERROR',
+        message: 'Failed to parse error response',
+        retryable: response.status >= 500
+      };
+    }
+  };
+
+  const startStreaming = useCallback(async (isRetry = false) => {
+    if (isRetry) {
+      setIsRetrying(true);
+      setRetryCount(prev => prev + 1);
+    } else {
+      setRetryCount(0);
+    }
+
     setIsStreaming(true);
     setIsComplete(false);
-    setContent('');
+    setError(null);
+    
+    if (!isRetry) {
+      setContent('');
+    }
+
+    // Create abort controller for this request
+    abortControllerRef.current = new AbortController();
 
     try {
       const response = await fetch('/api/generate', {
@@ -36,62 +91,154 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ prompt }),
+        signal: abortControllerRef.current.signal,
       });
 
       if (!response.ok) {
-        throw new Error('Failed to generate content');
+        const streamError = await parseErrorResponse(response);
+        setError(streamError);
+        
+        if (streamError.retryable && retryCount < maxRetries) {
+          showWarning('Connection issue', 'Retrying in a moment...');
+          setTimeout(() => {
+            startStreaming(true);
+          }, retryDelay * Math.pow(2, retryCount)); // Exponential backoff
+          return;
+        } else {
+          showError('Generation failed', streamError.message);
+          setContent(prev => prev + `\n\n[Error: ${streamError.message}]`);
+        }
+        return;
       }
 
       if (!response.body) {
-        throw new Error('No response body');
+        throw new Error('No response body received');
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let hasReceivedContent = false;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        
-        if (done) {
-          break;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          
+          if (done) {
+            break;
+          }
+
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk.trim()) {
+            hasReceivedContent = true;
+            setContent(prev => prev + chunk);
+          }
         }
 
-        const chunk = decoder.decode(value, { stream: true });
-        setContent(prev => prev + chunk);
-      }
+        if (!hasReceivedContent) {
+          throw new Error('No content received from server');
+        }
 
-      setIsComplete(true);
-      onComplete?.();
+        setIsComplete(true);
+        showSuccess('Plan generated successfully!', 'Your capstone plan is ready');
+        onComplete?.();
+      } catch (readError) {
+        if (readError instanceof Error && readError.name === 'AbortError') {
+          console.log('Stream aborted');
+          return;
+        }
+        throw readError;
+      }
     } catch (error) {
       console.error('Streaming error:', error);
-      setContent(prev => prev + '\n\n[Error: Failed to generate content. Please try again.]');
+      
+      if (error instanceof Error) {
+        if (error.name === 'AbortError') {
+          console.log('Request was aborted');
+          return;
+        }
+        
+        const streamError: StreamError = {
+          code: 'NETWORK_ERROR',
+          message: error.message.includes('fetch') 
+            ? 'Network connection failed. Please check your internet connection.'
+            : 'An error occurred while generating content.',
+          retryable: true
+        };
+        
+        setError(streamError);
+        
+        if (streamError.retryable && retryCount < maxRetries) {
+          showWarning('Connection issue', 'Retrying in a moment...');
+          setTimeout(() => {
+            startStreaming(true);
+          }, retryDelay * Math.pow(2, retryCount));
+          return;
+        } else {
+          showError('Generation failed', streamError.message);
+          setContent(prev => prev + `\n\n[Error: ${streamError.message}]`);
+        }
+      }
     } finally {
       setIsStreaming(false);
+      setIsRetrying(false);
+      abortControllerRef.current = null;
     }
-  };
+  }, [prompt, retryCount, maxRetries, retryDelay, showError, showSuccess, showWarning, onComplete]);
+
+  const handleRetry = useCallback(() => {
+    if (retryCount < maxRetries) {
+      startStreaming(true);
+    } else {
+      // Reset and try again
+      setRetryCount(0);
+      startStreaming();
+    }
+  }, [startStreaming, retryCount, maxRetries]);
 
   const copyToClipboard = async () => {
     try {
+      if (!content.trim()) {
+        showError('Nothing to copy', 'No content available to copy');
+        return;
+      }
+
       await navigator.clipboard.writeText(content);
-      // You could add a toast notification here
+      showSuccess('Copied to clipboard', 'Content has been copied to your clipboard');
     } catch (error) {
       console.error('Failed to copy:', error);
+      showError('Copy failed', 'Failed to copy content to clipboard. Please try again.');
     }
   };
 
   const downloadMarkdown = () => {
-    const blob = new Blob([content], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'capstone-plan.md';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      if (!content.trim()) {
+        showError('Nothing to download', 'No content available to download');
+        return;
+      }
+
+      const blob = new Blob([content], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `capstone-plan-${new Date().toISOString().split('T')[0]}.md`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showSuccess('Download started', 'Markdown file is being downloaded');
+    } catch (error) {
+      console.error('Failed to download:', error);
+      showError('Download failed', 'Failed to download file. Please try again.');
+    }
   };
 
   const downloadPDF = async () => {
+    if (!content.trim()) {
+      showError('Nothing to download', 'No content available to download as PDF');
+      return;
+    }
+
     setIsGeneratingPDF(true);
     try {
       // Dynamic import to avoid SSR issues
@@ -99,8 +246,7 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
       
       const element = contentRef.current;
       if (!element) {
-        console.error('Content element not found');
-        return;
+        throw new Error('Content element not found');
       }
 
       // Create a clean copy of the content for PDF generation
@@ -113,7 +259,7 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
       // Set up PDF options
       const opt = {
         margin: [0.5, 0.5, 0.5, 0.5],
-        filename: 'capstone-plan.pdf',
+        filename: `capstone-plan-${new Date().toISOString().split('T')[0]}.pdf`,
         image: { type: 'jpeg', quality: 0.98 },
         html2canvas: { 
           scale: 2,
@@ -131,10 +277,10 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
 
       // Generate and save PDF
       await html2pdf().set(opt).from(clonedElement).save();
+      showSuccess('PDF generated', 'PDF file has been downloaded successfully');
     } catch (error) {
       console.error('PDF generation error:', error);
-      // Fallback: show user-friendly error message
-      alert('Failed to generate PDF. Please try downloading as Markdown instead.');
+      showError('PDF generation failed', 'Failed to generate PDF. Please try downloading as Markdown instead.');
     } finally {
       setIsGeneratingPDF(false);
     }
@@ -204,6 +350,22 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
               </div>
             </div>
             <div className="flex gap-2">
+              {error && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRetry}
+                  disabled={isRetrying}
+                  className="hover:bg-yellow-50 dark:hover:bg-yellow-900/20 transition-colors border-yellow-300"
+                >
+                  {isRetrying ? (
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                  )}
+                  {isRetrying ? 'Retrying...' : 'Retry'}
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -251,7 +413,38 @@ export function StreamView({ prompt, onComplete }: StreamViewProps) {
               fontFamily: 'system-ui, sans-serif'
             }}
           >
-            {content ? (
+            {error && !content ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 bg-red-100 dark:bg-red-900/30 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                  <AlertCircle className="h-8 w-8 text-red-600" />
+                </div>
+                <h3 className="text-lg font-semibold text-red-600 dark:text-red-400 mb-2">
+                  Generation Failed
+                </h3>
+                <p className="text-gray-600 dark:text-gray-300 mb-4">
+                  {error.message}
+                </p>
+                <div className="flex gap-3 justify-center">
+                  <Button
+                    onClick={handleRetry}
+                    disabled={isRetrying}
+                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                  >
+                    {isRetrying ? (
+                      <>
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        Retrying...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-4 w-4 mr-2" />
+                        Try Again
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            ) : content ? (
               <div
                 className="markdown-content animate-in fade-in-50 duration-500"
                 dangerouslySetInnerHTML={{
